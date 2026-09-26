@@ -1,6 +1,6 @@
 # 直流配电树压降校核 API
 
-基于 FastAPI 的直流配电树校核服务：输入以 `source` 为根的配电树（电源电压、线段电阻与额定电流、各节点恒定负载、最低允许电压），自叶向根累计每段承载的全部下游电流，再自根向叶计算压降与节点电压，返回各段电流、各节点电压以及超额定电流 / 欠压位置；并可评估指定节点可追加的最大恒定负载电流（`/capacity`），根据若干线段的实测电流定位唯一未登记正恒定负载的候选节点（`/unregistered-load`），评估至多 K 条负载同时升至峰值时各线段 / 各节点的最坏越限风险（`/peak-risk`），在故障线段断开后评估各候选跨接线的恢复方案并择优（`/outage-restoration`），枚举可切除负载组合、选出以最小切除电流消除全部超额定与欠压的切负荷方案（`/load-shedding`），按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险（`/protection-selectivity`），为 1～10 条待投运负载搜索每步启动瞬间均不越限的完整可行投运顺序（`/startup-order`），按未舍入基线线段电流计算逐段线损（P=I²R）并按负载输入序号逐条归属（`/loss-allocation`），或从多组已知负载工况与节点实测电压辨识配电树各段电阻（`/resistance-calibration`）。
+基于 FastAPI 的直流配电树校核服务：输入以 `source` 为根的配电树（电源电压、线段电阻与额定电流、各节点恒定负载、最低允许电压），自叶向根累计每段承载的全部下游电流，再自根向叶计算压降与节点电压，返回各段电流、各节点电压以及超额定电流 / 欠压位置；并可评估指定节点可追加的最大恒定负载电流（`/capacity`），根据若干线段的实测电流定位唯一未登记正恒定负载的候选节点（`/unregistered-load`），评估至多 K 条负载同时升至峰值时各线段 / 各节点的最坏越限风险（`/peak-risk`），在故障线段断开后评估各候选跨接线的恢复方案并择优（`/outage-restoration`），枚举可切除负载组合、选出以最小切除电流消除全部超额定与欠压的切负荷方案（`/load-shedding`），按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险（`/protection-selectivity`），为 1～10 条待投运负载搜索每步启动瞬间均不越限的完整可行投运顺序（`/startup-order`），按未舍入基线线段电流计算逐段线损（P=I²R）并按负载输入序号逐条归属（`/loss-allocation`），从多组已知负载工况与节点实测电压辨识配电树各段电阻（`/resistance-calibration`），或在 1～12 段的线路上按各段单程耗时与风险分规划时限内总风险分最高的巡检往返路线（`/inspection-route`）。
 
 ## 快速启动（单条命令）
 
@@ -31,6 +31,7 @@ docker compose up --build
 - 投运顺序评估接口：`POST http://localhost:8000/startup-order`
 - 线损归属评估接口：`POST http://localhost:8000/loss-allocation`
 - 电阻辨识接口：`POST http://localhost:8000/resistance-calibration`
+- 巡检路线规划接口：`POST http://localhost:8000/inspection-route`
 
 ## 请求格式
 
@@ -825,6 +826,77 @@ curl -X POST http://localhost:8000/resistance-calibration \
 - `max_residual`：最大测点电压残差 (V)，六位小数；`calibrated` / `inconsistent` 时给出，`undetermined` 为 `null`。
 - `matrix_rank`：系数矩阵列秩；仅 `undetermined` 时给出（如上例只测节点 `a` 时列秩为 1），其余为 `null`。
 
+## 巡检路线规划：POST /inspection-route
+
+`POST /inspection-route`，Content-Type: `application/json`。在 1～12 段的线路树上规划巡检往返路线。请求复用 `/evaluate` 的 `segments`（结构同前，须构成以 `source` 为根的连通树，**限定 1～12 段**），另按 `segment_id` 为每段提供唯一的巡检参数（单程耗时与风险分），并给出非负整数巡检时限 `max_minutes`：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `segments` | array | 必填，1～12 条 | 线段列表，须构成以 `source` 为根的连通树（结构同 `/evaluate`） |
+| `segment_params` | array | 必填，覆盖全部线段 | 各线段巡检参数，按 `segment_id` 一一对应 |
+| `segment_params[].segment_id` | string | 必填，唯一且存在于树中 | 线段标识（重复、不存在或未覆盖全部线段返回 `400 invalid_input`） |
+| `segment_params[].travel_minutes` | integer | 必填，> 0 | 该段单程耗时 (分钟)，正整数（非正或非整数返回 `422`） |
+| `segment_params[].risk_score` | number | 必填，≥ 0 且为有限数 | 该段风险分（负数或 NaN/Infinity 返回 `422`） |
+| `max_minutes` | integer | 必填，≥ 0 | 巡检时限 (分钟)，非负整数（负数或非整数返回 `422`） |
+
+计算规则：
+
+- 巡检自 `source` 出发并返回；**到达某线段即视为巡检该段**，因此入选线段必须包含通往它的全部祖先段——入选集合构成含根的**连通子树**（祖先闭合）；
+- 每条入选线段**往返各走一次**，**总耗时 = 入选线段单程耗时之和 × 2**，不得超过 `max_minutes`（恰好等于时限可行）；
+- 枚举全部祖先闭合子树（至多 2^12），选出**总风险分最高**的可行方案；同分依次取**总耗时更少**、**排序后 `segment_id` 列表字典序更小**者（风险分按未舍入值比较，展示值按 6 位小数舍入）；
+- 空路线（不入选任何线段，总风险分 0、总耗时 0）恒可行，故**时限不足**——无任何非空可行子树——时返回仅含 `source` 的空路线；
+- 返回的 `path` 为**子节点按 `segment_id` 升序**的深度优先往返节点路径，起止均为 `source`（每条入选线段在路径中下行、上行各出现一次）。
+
+### 请求示例
+
+```bash
+curl -X POST http://localhost:8000/inspection-route \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"id": "s1", "parent": "source", "child": "a", "resistance": 0.1,  "rated_current": 20.0},
+      {"id": "s2", "parent": "a",      "child": "b", "resistance": 0.2,  "rated_current": 10.0},
+      {"id": "s3", "parent": "a",      "child": "c", "resistance": 0.05, "rated_current": 15.0},
+      {"id": "s4", "parent": "c",      "child": "d", "resistance": 0.1,  "rated_current": 10.0}
+    ],
+    "segment_params": [
+      {"segment_id": "s1", "travel_minutes": 5, "risk_score": 10.0},
+      {"segment_id": "s2", "travel_minutes": 3, "risk_score": 6.0},
+      {"segment_id": "s3", "travel_minutes": 2, "risk_score": 4.0},
+      {"segment_id": "s4", "travel_minutes": 1, "risk_score": 8.0}
+    ],
+    "max_minutes": 16
+  }'
+```
+
+### 响应示例（200）
+
+```json
+{
+  "selected_segments": ["s1", "s3", "s4"],
+  "total_risk_score": 22.0,
+  "total_travel_minutes": 16,
+  "path": ["source", "a", "c", "d", "c", "a", "source"]
+}
+```
+
+- 上例中全树需 22 分钟超出时限；候选方案 `{s1,s3,s4}`（风险 22，耗时 (5+2+1)×2 = 16）优于 `{s1,s2,s3}`（风险 20，耗时 20 亦超限）等，故入选。巡检 s4 必须连同祖先 s1、s3 一起入选。
+- `selected_segments`：入选线段 id，按 `segment_id` 升序；空路线为 `[]`。
+- `total_risk_score`：入选线段风险分总和（展示值按 6 位小数舍入）。
+- `total_travel_minutes`：总耗时 (分钟) = 入选线段单程耗时之和 × 2。
+- `path`：子节点按 `segment_id` 升序的深度优先往返节点路径，起止均为 `source`。
+
+时限不足（上例 `max_minutes` 小于最便宜的非空子树所需 10 分钟，如取 9）时返回仅含 `source` 的空路线：
+
+```json
+{
+  "selected_segments": [],
+  "total_risk_score": 0.0,
+  "total_travel_minutes": 0,
+  "path": ["source"]
+}
+```
+
 ## 错误说明
 
 所有错误均返回统一结构：
@@ -841,8 +913,8 @@ curl -X POST http://localhost:8000/resistance-calibration \
 
 | 状态码 | code | 触发场景 |
 | --- | --- | --- |
-| `422` | `validation_error` | 非正电源电压、负电阻、负负载电流、非正额定电流、实测电流为负或不是有限数（NaN/Infinity）、`peak_current` 为负或小于该负载 `current`、`max_simultaneous_peaks` 为负或缺失、`sheddable_loads` 超过 16 条 / 元素非整数、跨接线电阻为负 / 额定电流非正 / 必填字段缺失、保护曲线点电流非严格递增 / 曲线电流或动作时间为负或非有限数 / 曲线点为空 / 曲线或故障列表为空、故障电流非正或非有限数、最小级差为负或非有限数、`startup_loads` 不在 1～10 条范围内 / 待投运负载的稳态电流或启动电流为负或非有限数 / 启动电流小于稳态电流、`scenarios` 为空 / 工况电源电压非正或非有限数 / 测点电压非有限数、`tolerance` 为负或非有限数、字段缺失或类型错误等 |
-| `400` | `invalid_input` | 无效树（不连通、存在环路、节点多父节点、`source` 作为子节点、线段 id 重复）、负载引用不存在的节点、`target_node` 为 `source` / 不存在于树中、测量线段 id 重复 / 不存在于树中、故障线段不存在于树中，或跨接线 id 重复 / 与已有线段重复、供电侧 / 失电侧节点不存在或不在对应分量、`sheddable_loads` 序号越界（含负数）或重复、保护曲线未覆盖全部线段 / 线段 id 重复 / 曲线线段不存在于树中、故障节点不存在或为 `source`、待投运负载节点不存在于树中、电压测点节点工况内重复 / 不存在于树中 / 为 `source` |
+| `422` | `validation_error` | 非正电源电压、负电阻、负负载电流、非正额定电流、实测电流为负或不是有限数（NaN/Infinity）、`peak_current` 为负或小于该负载 `current`、`max_simultaneous_peaks` 为负或缺失、`sheddable_loads` 超过 16 条 / 元素非整数、跨接线电阻为负 / 额定电流非正 / 必填字段缺失、保护曲线点电流非严格递增 / 曲线电流或动作时间为负或非有限数 / 曲线点为空 / 曲线或故障列表为空、故障电流非正或非有限数、最小级差为负或非有限数、`startup_loads` 不在 1～10 条范围内 / 待投运负载的稳态电流或启动电流为负或非有限数 / 启动电流小于稳态电流、`scenarios` 为空 / 工况电源电压非正或非有限数 / 测点电压非有限数、`tolerance` 为负或非有限数、`segments` 超过 12 条（`/inspection-route`）/ `segment_params` 为空 / `travel_minutes` 非正整数 / `risk_score` 为负或非有限数 / `max_minutes` 为负或非整数、字段缺失或类型错误等 |
+| `400` | `invalid_input` | 无效树（不连通、存在环路、节点多父节点、`source` 作为子节点、线段 id 重复）、负载引用不存在的节点、`target_node` 为 `source` / 不存在于树中、测量线段 id 重复 / 不存在于树中、故障线段不存在于树中，或跨接线 id 重复 / 与已有线段重复、供电侧 / 失电侧节点不存在或不在对应分量、`sheddable_loads` 序号越界（含负数）或重复、保护曲线未覆盖全部线段 / 线段 id 重复 / 曲线线段不存在于树中、故障节点不存在或为 `source`、待投运负载节点不存在于树中、电压测点节点工况内重复 / 不存在于树中 / 为 `source`、巡检参数线段 id 重复 / 不存在于树中 / 未覆盖全部线段 |
 | `400` | `baseline_violation` | `/capacity` 与 `/startup-order` 基线校核（仅既有负载）已存在超额定电流或欠压，`details` 列出越限线段与节点 |
 
 注意：`/unregistered-load` 的 `inconsistent` / `undetermined` 与 `/resistance-calibration` 的 `undetermined` / `inconsistent` 是正常分析结论，以 `200` 返回并体现在响应体的 `status` 字段中，不属于上表错误。
@@ -860,7 +932,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py    # FastAPI 应用与错误处理
-  core.py    # 树校验 + 电流累计 + 压降计算 + 增容评估 + 未登记负载定位 + 峰值风险评估 + 故障恢复评估 + 切负荷方案 + 保护选择性校核 + 投运顺序搜索 + 线损归属 + 电阻辨识
+  core.py    # 树校验 + 电流累计 + 压降计算 + 增容评估 + 未登记负载定位 + 峰值风险评估 + 故障恢复评估 + 切负荷方案 + 保护选择性校核 + 投运顺序搜索 + 线损归属 + 电阻辨识 + 巡检路线规划
   models.py  # 请求 / 响应模型
 tests/
   test_evaluate.py
@@ -873,6 +945,7 @@ tests/
   test_startup_order.py
   test_loss_allocation.py
   test_resistance_calibration.py
+  test_inspection_route.py
 Dockerfile
 docker-compose.yml
 requirements.txt

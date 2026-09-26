@@ -535,6 +535,49 @@ class ResistanceCalibrationResponse(BaseModel):
     )
 
 
+class InspectionSegmentParamInput(BaseModel):
+    """一条线段的巡检参数：单程耗时与风险分。"""
+
+    segment_id: str = Field(
+        min_length=1, description="线段标识，须存在于树中；每条线段恰配置一条巡检参数"
+    )
+    travel_minutes: int = Field(gt=0, description="单程耗时 (分钟)，必须为正整数")
+    risk_score: float = Field(
+        ge=0, allow_inf_nan=False, description="风险分，须为非负有限数"
+    )
+
+
+class InspectionRouteRequest(BaseModel):
+    """巡检路线规划请求：复用 segments（1～12 段），另给各段巡检参数与非负整数时限。"""
+
+    segments: list[SegmentInput] = Field(
+        min_length=1,
+        max_length=12,
+        description="线段列表（1～12 条），须构成以 source 为根的连通树",
+    )
+    segment_params: list[InspectionSegmentParamInput] = Field(
+        min_length=1,
+        description="各线段巡检参数（按 segment_id 对应），须覆盖全部线段且不得重复",
+    )
+    max_minutes: int = Field(ge=0, description="巡检时限 (分钟)，非负整数")
+
+
+class InspectionRouteResponse(BaseModel):
+    selected_segments: list[str] = Field(
+        description="入选线段 id（按 segment_id 升序）；时限不足时为空列表"
+    )
+    total_risk_score: float = Field(
+        description="入选线段风险分总和，展示值按 6 位小数舍入；空路线为 0.0"
+    )
+    total_travel_minutes: int = Field(
+        description="总耗时 (分钟)：入选线段单程耗时之和的两倍；空路线为 0"
+    )
+    path: list[str] = Field(
+        description="深度优先往返节点路径（子节点按 segment_id 升序），起止均为 source；"
+        "空路线仅含 source"
+    )
+
+
 class LossAllocationRequest(EvaluateRequest):
     """线损归属评估请求：与 /evaluate 参数完全相同（min_voltage 参与校验但不影响线损计算）。"""
 

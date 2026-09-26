@@ -11,6 +11,7 @@ from .core import (
     InputValidationError,
     capacity,
     evaluate,
+    inspection_route,
     load_shedding,
     loss_allocation,
     outage_restoration,
@@ -25,6 +26,8 @@ from .models import (
     CapacityResponse,
     EvaluateRequest,
     EvaluateResponse,
+    InspectionRouteRequest,
+    InspectionRouteResponse,
     LoadSheddingRequest,
     LoadSheddingResponse,
     LossAllocationRequest,
@@ -56,9 +59,10 @@ app = FastAPI(
         "按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险，"
         "为待投运负载搜索每步启动瞬间均不越限的完整可行投运顺序，"
         "按未舍入基线线段电流计算逐段线损（P=I²R）并按负载输入序号逐条归属，"
-        "或从多组已知负载工况与节点实测电压辨识配电树各段电阻（输入线段电阻不参与拟合）。"
+        "从多组已知负载工况与节点实测电压辨识配电树各段电阻（输入线段电阻不参与拟合），"
+        "或在 1～12 段的线路上按各段单程耗时与风险分规划时限内总风险分最高的巡检往返路线。"
     ),
-    version="1.9.0",
+    version="1.10.0",
 )
 
 
@@ -100,6 +104,10 @@ _FIELD_LABELS = {
     "scenarios": "工况列表",
     "voltage": "电压",
     "tolerance": "残差容限",
+    "segment_params": "线段巡检参数列表",
+    "travel_minutes": "单程耗时",
+    "risk_score": "风险分",
+    "max_minutes": "巡检时限",
 }
 
 # measurements 内字段的中文标签（与负载字段同名时区分为“实测”）
@@ -140,6 +148,9 @@ _CUSTOM_MESSAGES = {
     ("steady_current", "greater_than_equal"): "稳态电流不能为负（须 ≥ 0）",
     ("startup_current", "greater_than_equal"): "启动电流不能为负（须 ≥ 0）",
     ("tolerance", "greater_than_equal"): "残差容限不能为负（须 ≥ 0）",
+    ("travel_minutes", "greater_than"): "单程耗时必须为正整数（> 0）",
+    ("risk_score", "greater_than_equal"): "风险分不能为负（须 ≥ 0）",
+    ("max_minutes", "greater_than_equal"): "巡检时限不能为负（须 ≥ 0）",
 }
 
 # curves 内字段的定制提示（“current” 与负载字段同名，须区分）
@@ -386,6 +397,19 @@ def resistance_calibration_endpoint(payload: ResistanceCalibrationRequest) -> di
     )
 
 
+@app.post(
+    "/inspection-route",
+    response_model=InspectionRouteResponse,
+    summary="规划时限内总风险分最高的巡检往返路线（含根连通子树）",
+)
+def inspection_route_endpoint(payload: InspectionRouteRequest) -> dict:
+    return inspection_route(
+        segments_in=payload.segments,
+        segment_params_in=payload.segment_params,
+        max_minutes=payload.max_minutes,
+    )
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
@@ -403,6 +427,7 @@ def index() -> dict:
         "startup_order": "POST /startup-order",
         "loss_allocation": "POST /loss-allocation",
         "resistance_calibration": "POST /resistance-calibration",
+        "inspection_route": "POST /inspection-route",
         "docs": "/docs",
         "health": "/health",
     }

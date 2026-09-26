@@ -57,6 +57,15 @@ source 所在分量接入失电分量任意节点，失电分量从接入点重�
 （Lawson–Hanson 活动集法）。系数矩阵列秩不足返回 ``undetermined`` 与矩阵秩；满秩但
 最大测点电压残差超过容限返回 ``inconsistent`` 与最大残差；否则返回 ``calibrated``、
 输入顺序的各段估计电阻与最大残差（展示值按 6 位小数舍入，判定使用未舍入值）。
+
+``inspection_route`` 在 1～12 段的配电树上规划巡检路线：每条线段按 segment_id 配置
+唯一的正整数单程耗时与非负风险分。巡检自 source 出发并返回，到达某线段即视为巡检
+该段，故入选线段必须祖先闭合（包含通往它的全部祖先段），构成含根的连通子树；每条
+入选线段往返各走一次，总耗时为单程耗时之和的两倍，不得超过非负整数时限
+``max_minutes``。枚举全部祖先闭合子树，选出总风险分最高的可行方案；同分依次取
+总耗时更少、排序后 segment_id 列表字典序更小者。返回入选线段（id 升序）、总风险分、
+总耗时与子节点按 segment_id 升序的深度优先往返节点路径；时限不足（无任何非空可行
+子树）时返回仅含 source 的空路线。
 """
 
 from __future__ import annotations
@@ -1684,4 +1693,106 @@ def resistance_calibration(segments_in: Sequence, scenarios_in: Sequence, tolera
         ],
         "max_residual": _round(max_residual),
         "matrix_rank": None,
+    }
+
+
+def inspection_route(segments_in: Sequence, segment_params_in: Sequence, max_minutes: int) -> dict:
+    """规划总风险分最高的可行巡检连通子树，返回可 JSON 序列化的结果字典。
+
+    巡检自 source 出发并返回；到达某线段即视为巡检该段，故入选线段必须祖先闭合
+    （包含通往它的全部祖先段），构成含根的连通子树。每条入选线段往返各走一次，
+    总耗时 = 单程耗时之和 × 2，不得超过 ``max_minutes``（非负整数，由请求模型保证）。
+    线段条数 1～12（由请求模型保证），枚举全部祖先闭合子树（至多 2^12）择优：
+
+    - 总风险分最高者入选（未舍入值比较，EPS 内视为并列）；
+    - 并列时取总耗时更少者；
+    - 再并列时取排序后 segment_id 列表字典序更小者。
+
+    空路线（不入选任何线段，总风险分 0、总耗时 0）恒可行，故时限不足——无任何
+    非空可行子树——时自然返回仅含 source 的空路线。返回的节点路径为子节点按
+    segment_id 升序的深度优先往返路径，起止均为 source。
+    """
+    segments, parent_of = _validate_and_build_tree(segments_in)
+
+    # 巡检参数校验：线段 id 存在、不重复且覆盖全部线段
+    known_seg_ids = {seg.id for seg in segments}
+    errors: list[str] = []
+    seen_ids: set[str] = set()
+    param_map: dict[str, tuple[int, float]] = {}
+    for param in segment_params_in:
+        seg_id = param.segment_id
+        if seg_id in seen_ids:
+            errors.append(f"线段 '{seg_id}' 的巡检参数重复定义")
+        seen_ids.add(seg_id)
+        if seg_id not in known_seg_ids:
+            errors.append(f"巡检参数线段 '{seg_id}' 不存在于树中")
+        elif seg_id not in param_map:
+            param_map[seg_id] = (param.travel_minutes, param.risk_score)
+    for seg in segments:  # 保持输入顺序
+        if seg.id not in param_map:
+            errors.append(f"线段 '{seg.id}' 缺少巡检参数")
+    if errors:
+        raise InputValidationError("巡检参数定义无效", errors)
+
+    # 每条线段的祖先线段集合（不含自身），用于祖先闭合（连通子树）判定
+    seg_by_child = {seg.child: seg for seg in segments}
+    ancestors: dict[str, set[str]] = {}
+    for seg in segments:
+        ids: set[str] = set()
+        node = seg.parent
+        while node != ROOT_NODE:
+            up = seg_by_child[node]
+            ids.add(up.id)
+            node = up.parent
+        ancestors[seg.id] = ids
+
+    # 枚举全部子集，筛选祖先闭合且时限可行的方案，按（风险分降序, 耗时升序,
+    # 排序后 id 列表字典序）择优；空集恒可行，作为初始最优（即空路线兜底）
+    seg_ids = [seg.id for seg in segments]
+    n = len(seg_ids)
+    best_ids: list[str] = []
+    best_score = 0.0
+    best_time = 0
+    for mask in range(1, 1 << n):
+        chosen = [seg_ids[i] for i in range(n) if mask >> i & 1]
+        chosen_set = set(chosen)
+        if any(not ancestors[seg_id] <= chosen_set for seg_id in chosen):
+            continue  # 缺少通往某入选线段的祖先段，非连通子树
+        time = 2 * sum(param_map[seg_id][0] for seg_id in chosen)
+        if time > max_minutes:
+            continue
+        score = sum(param_map[seg_id][1] for seg_id in chosen)
+        sorted_ids = sorted(chosen)
+        if score > best_score + EPS or (
+            abs(score - best_score) <= EPS
+            and (time < best_time or (time == best_time and sorted_ids < best_ids))
+        ):
+            best_ids = sorted_ids
+            best_score = score
+            best_time = time
+
+    # 子节点按 segment_id 升序的深度优先往返节点路径（起止均为 source）
+    best_set = set(best_ids)
+    children_map: dict[str, list[Segment]] = {}
+    for seg in segments:
+        if seg.id in best_set:
+            children_map.setdefault(seg.parent, []).append(seg)
+    for child_segments in children_map.values():
+        child_segments.sort(key=lambda seg: seg.id)
+
+    path = [ROOT_NODE]
+
+    def _dfs(node: str) -> None:
+        for seg in children_map.get(node, []):
+            path.append(seg.child)
+            _dfs(seg.child)
+            path.append(node)
+
+    _dfs(ROOT_NODE)
+
+    return {
+        "selected_segments": best_ids,
+        "total_risk_score": _round(best_score),
+        "total_travel_minutes": best_time,
+        "path": path,
     }
