@@ -57,6 +57,14 @@ source 所在分量接入失电分量任意节点，失电分量从接入点重�
 （Lawson–Hanson 活动集法）。系数矩阵列秩不足返回 ``undetermined`` 与矩阵秩；满秩但
 最大测点电压残差超过容限返回 ``inconsistent`` 与最大残差；否则返回 ``calibrated``、
 输入顺序的各段估计电阻与最大残差（展示值按 6 位小数舍入，判定使用未舍入值）。
+
+``inspection_route`` 在 1～12 段的线路树（沿用 ``evaluate`` 的 segments 树校验，电阻 /
+额定电流不参与计算）上规划巡检路线：每段按 segment_id 配置正整数单程耗时与风险分，
+巡检自 source 出发并返回，到达某线段即视为巡检该段，故入选线段必须包含通往它的全部
+祖先段（含根的连通子树）；每条入选线段往返各走一次，总耗时为单程耗时之和的两倍，
+须不超过非负整数时限。枚举全部可行连通子树，选总风险分最高者，同分先选耗时更少、
+再选排序后 segment_id 列表字典序更小者；时限不足时返回仅含 source 的空路线，并给出
+按 segment_id 排序子节点的深度优先往返节点路径。
 """
 
 from __future__ import annotations
@@ -1684,4 +1692,115 @@ def resistance_calibration(segments_in: Sequence, scenarios_in: Sequence, tolera
         ],
         "max_residual": _round(max_residual),
         "matrix_rank": None,
+    }
+
+
+def inspection_route(segments_in: Sequence, segment_params_in: Sequence, max_minutes: int) -> dict:
+    """在巡检时限内选出总风险分最高的连通巡检子树，返回可 JSON 序列化的结果字典。
+
+    线段列表沿用 ``evaluate`` 的树校验（电阻 / 额定电流不参与巡检计算），逐段巡检
+    参数（正整数单程耗时、风险分）按 segment_id 给出，须覆盖全部线段且不得重复。
+    巡检自 source 出发并返回：到达某线段即视为巡检该段，故入选线段必须包含通往它
+    的全部祖先段（入选集合为含根的连通子树）；每条入选线段往返各走一次，总耗时 =
+    入选线段单程耗时之和的两倍，须不超过 ``max_minutes``（恰好等于允许）。
+
+    线段数不超过 12（请求模型保证），按位掩码枚举全部线段子集，筛出祖先封闭
+    （含根连通）且不超时限的子集：选总风险分最高者，同分先选总耗时更少、再选排序后
+    segment_id 列表字典序更小者（风险分比较含 EPS 容差，耗时为整数精确比较）。空路线
+    （仅 source，风险分 0、耗时 0）恒可行：时限不足或无可提升总风险分的线段时返回
+    空路线。往返路径按子节点 segment_id 升序深度优先生成。
+    """
+    segments, _ = _validate_and_build_tree(segments_in)
+
+    # 巡检参数校验：线段 id 存在、不重复且覆盖全部线段
+    known_seg_ids = {seg.id for seg in segments}
+    errors: list[str] = []
+    seen_ids: set[str] = set()
+    travel_map: dict[str, int] = {}
+    risk_map: dict[str, float] = {}
+    for param in segment_params_in:
+        seg_id = param.segment_id
+        if seg_id in seen_ids:
+            errors.append(f"线段 '{seg_id}' 的巡检参数重复定义")
+        seen_ids.add(seg_id)
+        if seg_id not in known_seg_ids:
+            errors.append(f"巡检参数线段 '{seg_id}' 不存在于树中")
+        elif seg_id not in travel_map:
+            travel_map[seg_id] = param.travel_minutes
+            risk_map[seg_id] = param.risk_score
+    for seg in segments:  # 保持输入顺序
+        if seg.id not in travel_map:
+            errors.append(f"线段 '{seg.id}' 缺少巡检参数")
+    if errors:
+        raise InputValidationError("巡检参数定义无效", errors)
+
+    children_map: dict[str, list[Segment]] = {}
+    for seg in segments:
+        children_map.setdefault(seg.parent, []).append(seg)
+
+    # 位掩码枚举全部线段子集（至多 2^12 = 4096 个），空集即空路线，作为初始最优
+    n = len(segments)
+    seg_by_child = {seg.child: seg for seg in segments}
+    seg_index = {seg.id: i for i, seg in enumerate(segments)}
+    best_risk = 0.0
+    best_time = 0
+    best_ids: tuple[str, ...] = ()
+
+    def _is_better(risk: float, time: int, ids: tuple[str, ...]) -> bool:
+        if risk > best_risk + EPS:
+            return True
+        if risk < best_risk - EPS:
+            return False
+        if time != best_time:
+            return time < best_time
+        return ids < best_ids
+
+    for mask in range(1 << n):
+        # 祖先封闭性：入选线段的全部祖先段必须一并入选（含根连通子树）
+        ancestor_closed = True
+        for i, seg in enumerate(segments):
+            if not mask >> i & 1:
+                continue
+            node = seg.parent
+            while node != ROOT_NODE:
+                parent_seg = seg_by_child[node]
+                if not mask >> seg_index[parent_seg.id] & 1:
+                    ancestor_closed = False
+                    break
+                node = parent_seg.parent
+            if not ancestor_closed:
+                break
+        if not ancestor_closed:
+            continue
+
+        time = 0
+        risk = 0.0
+        ids = []
+        for i, seg in enumerate(segments):
+            if mask >> i & 1:
+                time += 2 * travel_map[seg.id]
+                risk += risk_map[seg.id]
+                ids.append(seg.id)
+        if time > max_minutes:
+            continue
+        sorted_ids = tuple(sorted(ids))
+        if _is_better(risk, time, sorted_ids):
+            best_risk, best_time, best_ids = risk, time, sorted_ids
+
+    selected = set(best_ids)
+
+    # 深度优先往返节点路径：子节点按 segment_id 升序
+    def _walk(node: str) -> list[str]:
+        path = [node]
+        for seg in sorted(children_map.get(node, []), key=lambda s: s.id):
+            if seg.id in selected:
+                path.extend(_walk(seg.child))
+                path.append(node)
+        return path
+
+    return {
+        "selected_segments": sorted(selected),
+        "total_risk_score": _round(best_risk),
+        "total_minutes": best_time,
+        "path": _walk(ROOT_NODE),
     }
